@@ -10,7 +10,17 @@ API_KEY = os.getenv("LOOP_API_KEY", "lm-studio")
 MODEL = os.getenv("LOOP_MODEL", "qwen/qwen3-coder-30b")
 WORKSPACE = Path.cwd()
 
+MAX_TURNS = 12
+MAX_TOOL_CALLS = 24
+
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+
+
+class ToolError(Exception):
+    def __init__(self, error_type: str, message: str, retryable: bool):
+        self.error_type = error_type
+        self.message = message
+        self.retryable = retryable
 
 
 tools = [
@@ -18,11 +28,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "list_dir",
-            "description": (
-                "List files in a workspace directory. "
-                "Use this when you need to discover file names. "
-                "Path must be relative to the workspace."
-            ),
+            "description": "List files in a workspace directory.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -41,9 +47,7 @@ tools = [
             "name": "read_file",
             "description": (
                 "Read a UTF-8 text file from the workspace. "
-                "Use this when you need exact file contents. "
-                "For listing filenames, use list_dir instead. "
-                "Path must be relative to the workspace."
+                "Use this when you need exact file contents."
             ),
             "parameters": {
                 "type": "object",
@@ -61,11 +65,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": (
-                "Write a UTF-8 text file inside the workspace. "
-                "Use this when you need to create or replace a whole file. "
-                "Path must be relative to the workspace."
-            ),
+            "description": "Write a UTF-8 text file inside the workspace.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -85,45 +85,179 @@ tools = [
 ]
 
 
+def log_event(event: dict) -> None:
+    print(json.dumps(event, ensure_ascii=False))
+
+
 def safe_path(path: str) -> Path:
     resolved = (WORKSPACE / path).resolve()
     if not resolved.is_relative_to(WORKSPACE):
-        raise ValueError("Path escapes the workspace")
+        raise ToolError(
+            "permission",
+            "Path escapes the workspace.",
+            retryable=False,
+        )
     return resolved
 
 
-def list_dir(path: str) -> str:
+def list_dir(path: str) -> list[str]:
     target = safe_path(path)
-    return "\n".join(sorted(p.name for p in target.iterdir()))
+    return sorted(p.name for p in target.iterdir())
 
 
 def read_file(path: str) -> str:
     return safe_path(path).read_text()
 
 
-def write_file(path: str, content: str) -> str:
+def write_file(path: str, content: str) -> dict:
     target = safe_path(path)
     target.write_text(content)
-    return f"Wrote {len(content)} characters to {path}"
+    return {
+        "path": path,
+        "message": f"Wrote {len(content)} characters.",
+    }
 
 
-def run_tool(name: str, arguments: dict) -> str:
+TOOL_REGISTRY = {
+    "list_dir": lambda args: list_dir(args["path"]),
+    "read_file": lambda args: read_file(args["path"]),
+    "write_file": lambda args: write_file(args["path"], args["content"]),
+}
+
+REQUIRED_ARGUMENTS = {
+    "list_dir": ["path"],
+    "read_file": ["path"],
+    "write_file": ["path", "content"],
+}
+
+
+def parse_arguments(raw_arguments: str) -> dict:
     try:
-        if name == "list_dir":
-            return list_dir(arguments["path"])
-        if name == "read_file":
-            return read_file(arguments["path"])
-        if name == "write_file":
-            return write_file(arguments["path"], arguments["content"])
-        return f"Unknown tool: {name}"
-    except Exception as error:
-        return json.dumps(
-            {
-                "ok": False,
-                "error_type": type(error).__name__,
-                "message": str(error),
-            }
+        return json.loads(raw_arguments or "{}")
+    except json.JSONDecodeError as error:
+        raise ToolError(
+            "invalid_tool_arguments",
+            f"Arguments were not valid JSON: {error}",
+            retryable=True,
         )
+
+
+def require(arguments: dict, *names: str) -> None:
+    missing = [name for name in names if name not in arguments]
+    if missing:
+        raise ToolError(
+            "missing_arguments",
+            f"Missing required arguments: {', '.join(missing)}",
+            retryable=True,
+        )
+
+
+def validate_tool_call(name: str, arguments: dict) -> None:
+    if name not in TOOL_REGISTRY:
+        raise ToolError("unknown_tool", f"Unknown tool: {name}", False)
+
+    require(arguments, *REQUIRED_ARGUMENTS[name])
+
+
+def check_policy(name: str, arguments: dict) -> dict:
+    if name in {"list_dir", "read_file", "write_file"}:
+        safe_path(arguments["path"])
+
+    return {"ok": True}
+
+
+def error_result(name: str, error: ToolError) -> dict:
+    return {
+        "ok": False,
+        "tool": name,
+        "error_type": error.error_type,
+        "retryable": error.retryable,
+        "message": error.message,
+    }
+
+
+def handle_tool_call(tool_call) -> dict:
+    name = tool_call.function.name
+
+    try:
+        arguments = parse_arguments(tool_call.function.arguments)
+        validate_tool_call(name, arguments)
+
+        policy = check_policy(name, arguments)
+        if not policy["ok"]:
+            return policy
+
+        data = TOOL_REGISTRY[name](arguments)
+        return {
+            "ok": True,
+            "tool": name,
+            "data": data,
+        }
+    except ToolError as error:
+        return error_result(name, error)
+
+
+def call_model(messages: list[dict]):
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+    )
+    return response.choices[0].message
+
+
+def run_agent(messages: list[dict]) -> dict:
+    tool_call_count = 0
+    stop_reason = "max_turns"
+
+    for turn in range(MAX_TURNS):
+        log_event({"type": "model_call", "turn": turn})
+        message = call_model(messages)
+        messages.append(message.model_dump(exclude_none=True))
+
+        if message.content:
+            print("\nassistant:")
+            print(message.content)
+
+        if not message.tool_calls:
+            stop_reason = "final_answer"
+            break
+
+        for tool_call in message.tool_calls:
+            tool_call_count += 1
+            if tool_call_count > MAX_TOOL_CALLS:
+                stop_reason = "tool_budget_exceeded"
+                break
+
+            result = handle_tool_call(tool_call)
+
+            log_event(
+                {
+                    "type": "tool_result",
+                    "turn": turn,
+                    "tool": result.get("tool"),
+                    "ok": result["ok"],
+                    "error_type": result.get("error_type"),
+                }
+            )
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(result),
+                }
+            )
+
+        if stop_reason != "max_turns":
+            break
+
+    return {
+        "messages": messages,
+        "stop_reason": stop_reason,
+        "tool_call_count": tool_call_count,
+    }
 
 
 messages = [
@@ -145,36 +279,5 @@ messages = [
 ]
 
 
-while True:
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        tools=tools,
-        tool_choice="auto",
-    )
-
-    message = response.choices[0].message
-    messages.append(message.model_dump(exclude_none=True))
-
-    if message.content:
-        print("\nassistant:")
-        print(message.content)
-
-    if not message.tool_calls:
-        break
-
-    for tool_call in message.tool_calls:
-        name = tool_call.function.name
-        arguments = json.loads(tool_call.function.arguments or "{}")
-
-        print(f"\ntool call: {name}({arguments})")
-        result = run_tool(name, arguments)
-        print(f"tool result:\n{result}")
-
-        messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result,
-            }
-        )
+result = run_agent(messages)
+print(f"Stopped because: {result['stop_reason']}")

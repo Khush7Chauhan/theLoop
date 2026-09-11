@@ -7,13 +7,21 @@ from openai import OpenAI
 
 BASE_URL = os.getenv("LOOP_BASE_URL", "http://localhost:1234/v1")
 API_KEY = os.getenv("LOOP_API_KEY", "lm-studio")
-MODEL = os.getenv("LOOP_MODEL", "qwen/qwen3-coder-30b")
-WORKSPACE = Path.cwd()
-
-MAX_TURNS = 12
-MAX_TOOL_CALLS = 24
+MODEL = os.getenv("LOOP_MODEL", "qwen/qwen2.5-vl-7b")
+WORKSPACE = Path.cwd().resolve()
+MAX_TURNS = 8
+MAX_TOOL_CALLS = 12
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+
+IGNORED_NAMES = {
+    ".git",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "dist",
+    "build",
+}
 
 
 class ToolError(Exception):
@@ -23,12 +31,60 @@ class ToolError(Exception):
         self.retryable = retryable
 
 
+def safe_path(path: str) -> Path:
+    resolved = (WORKSPACE / path).resolve()
+    if not resolved.is_relative_to(WORKSPACE):
+        raise ToolError(
+            "permission",
+            "Path escapes the workspace.",
+            retryable=False,
+        )
+    return resolved
+
+
+def list_dir(path: str) -> list[str]:
+    target = safe_path(path)
+    return sorted(
+        p.name
+        for p in target.iterdir()
+        if p.name not in IGNORED_NAMES
+    )
+
+
+def read_file(path: str) -> str:
+    target = safe_path(path)
+    return target.read_text(encoding="utf-8")
+
+
+def write_file(path: str, content: str) -> str:
+    target = safe_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return f"Wrote {path}"
+
+
+TOOL_FUNCTIONS = {
+    "list_dir": list_dir,
+    "read_file": read_file,
+    "write_file": write_file,
+}
+
+REQUIRED_ARGUMENTS = {
+    "list_dir": ["path"],
+    "read_file": ["path"],
+    "write_file": ["path", "content"],
+}
+
 tools = [
     {
         "type": "function",
         "function": {
             "name": "list_dir",
-            "description": "List files in a workspace directory.",
+            "description": (
+                "List visible files and folders inside the workspace. "
+                "Use this to inspect project structure. "
+                "Path must be relative to the workspace."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -47,7 +103,8 @@ tools = [
             "name": "read_file",
             "description": (
                 "Read a UTF-8 text file from the workspace. "
-                "Use this when you need exact file contents."
+                "Use this when you need exact file contents. "
+                "Path must be relative to the workspace."
             ),
             "parameters": {
                 "type": "object",
@@ -65,7 +122,11 @@ tools = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write a UTF-8 text file inside the workspace.",
+            "description": (
+                "Write a UTF-8 text file inside the workspace. "
+                "Use this only when the task requires changing or creating a file. "
+                "Path must be relative to the workspace."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -83,52 +144,6 @@ tools = [
         },
     },
 ]
-
-
-def log_event(event: dict) -> None:
-    print(json.dumps(event, ensure_ascii=False))
-
-
-def safe_path(path: str) -> Path:
-    resolved = (WORKSPACE / path).resolve()
-    if not resolved.is_relative_to(WORKSPACE):
-        raise ToolError(
-            "permission",
-            "Path escapes the workspace.",
-            retryable=False,
-        )
-    return resolved
-
-
-def list_dir(path: str) -> list[str]:
-    target = safe_path(path)
-    return sorted(p.name for p in target.iterdir())
-
-
-def read_file(path: str) -> str:
-    return safe_path(path).read_text()
-
-
-def write_file(path: str, content: str) -> dict:
-    target = safe_path(path)
-    target.write_text(content)
-    return {
-        "path": path,
-        "message": f"Wrote {len(content)} characters.",
-    }
-
-
-TOOL_REGISTRY = {
-    "list_dir": lambda args: list_dir(args["path"]),
-    "read_file": lambda args: read_file(args["path"]),
-    "write_file": lambda args: write_file(args["path"], args["content"]),
-}
-
-REQUIRED_ARGUMENTS = {
-    "list_dir": ["path"],
-    "read_file": ["path"],
-    "write_file": ["path", "content"],
-}
 
 
 def parse_arguments(raw_arguments: str) -> dict:
@@ -153,17 +168,27 @@ def require(arguments: dict, *names: str) -> None:
 
 
 def validate_tool_call(name: str, arguments: dict) -> None:
-    if name not in TOOL_REGISTRY:
+    if name not in REQUIRED_ARGUMENTS:
         raise ToolError("unknown_tool", f"Unknown tool: {name}", False)
-
     require(arguments, *REQUIRED_ARGUMENTS[name])
 
 
 def check_policy(name: str, arguments: dict) -> dict:
-    if name in {"list_dir", "read_file", "write_file"}:
-        safe_path(arguments["path"])
-
+    if name == "write_file":
+        path = arguments.get("path", "")
+        if path.startswith(".loop/"):
+            return {
+                "ok": False,
+                "tool": name,
+                "error_type": "permission",
+                "message": "The agent may not write into .loop internal state.",
+                "retryable": False,
+            }
     return {"ok": True}
+
+
+def normalize_result(name: str, result) -> dict:
+    return {"ok": True, "tool": name, "result": result}
 
 
 def error_result(name: str, error: ToolError) -> dict:
@@ -171,30 +196,31 @@ def error_result(name: str, error: ToolError) -> dict:
         "ok": False,
         "tool": name,
         "error_type": error.error_type,
-        "retryable": error.retryable,
         "message": error.message,
+        "retryable": error.retryable,
     }
+
+
+def execute_tool(name: str, arguments: dict):
+    return TOOL_FUNCTIONS[name](**arguments)
 
 
 def handle_tool_call(tool_call) -> dict:
     name = tool_call.function.name
-
     try:
         arguments = parse_arguments(tool_call.function.arguments)
         validate_tool_call(name, arguments)
-
         policy = check_policy(name, arguments)
         if not policy["ok"]:
             return policy
-
-        data = TOOL_REGISTRY[name](arguments)
-        return {
-            "ok": True,
-            "tool": name,
-            "data": data,
-        }
+        result = execute_tool(name, arguments)
+        return normalize_result(name, result)
     except ToolError as error:
         return error_result(name, error)
+
+
+def log_event(event: dict) -> None:
+    print(json.dumps(event))
 
 
 def call_model(messages: list[dict]):
@@ -231,7 +257,6 @@ def run_agent(messages: list[dict]) -> dict:
                 break
 
             result = handle_tool_call(tool_call)
-
             log_event(
                 {
                     "type": "tool_result",
@@ -265,8 +290,8 @@ messages = [
         "role": "system",
         "content": (
             "You are a tiny coding agent. Use tools when you need to inspect "
-            "or change the workspace. When you have enough information, "
-            "answer clearly."
+            "or change the workspace. Paths must stay inside the workspace. "
+            "When you have enough information, answer clearly."
         ),
     },
     {

@@ -1,5 +1,7 @@
+import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 from openai import OpenAI
@@ -8,11 +10,12 @@ from openai import OpenAI
 BASE_URL = os.getenv("LOOP_BASE_URL", "http://localhost:1234/v1")
 API_KEY = os.getenv("LOOP_API_KEY", "lm-studio")
 MODEL = os.getenv("LOOP_MODEL", "qwen/qwen2.5-vl-7b")
-WORKSPACE = Path.cwd().resolve()
 MAX_TURNS = 8
 MAX_TOOL_CALLS = 12
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+session_approvals: set[str] = set()
+WORKSPACE = Path.cwd().resolve()
 
 IGNORED_NAMES = {
     ".git",
@@ -22,6 +25,10 @@ IGNORED_NAMES = {
     "dist",
     "build",
 }
+
+SENSITIVE_PATHS = (".env", "secrets/")
+INTERNAL_PATHS = (".loop/",)
+SOURCE_PATHS = ("src/", "tests/")
 
 
 class ToolError(Exception):
@@ -40,6 +47,36 @@ def safe_path(path: str) -> Path:
             retryable=False,
         )
     return resolved
+
+
+def path_starts_with(path: str, prefixes: tuple[str, ...]) -> bool:
+    return any(
+        path == prefix.rstrip("/") or path.startswith(prefix)
+        for prefix in prefixes
+    )
+
+
+def allow() -> dict:
+    return {"decision": "allow"}
+
+
+def deny(message: str) -> dict:
+    return {
+        "decision": "deny",
+        "message": message,
+        "retryable": False,
+    }
+
+
+def ask(message: str, risk: str, rule_hint: str) -> dict:
+    return {
+        "decision": "ask",
+        "message": message,
+        "risk": risk,
+        "rule_hint": rule_hint,
+        "approval_scopes": ["once", "session"],
+        "retryable": False,
+    }
 
 
 def list_dir(path: str) -> list[str]:
@@ -174,17 +211,59 @@ def validate_tool_call(name: str, arguments: dict) -> None:
 
 
 def check_policy(name: str, arguments: dict) -> dict:
-    if name == "write_file":
-        path = arguments.get("path", "")
-        if path.startswith(".loop/"):
-            return {
-                "ok": False,
-                "tool": name,
-                "error_type": "permission",
-                "message": "The agent may not write into .loop internal state.",
-                "retryable": False,
-            }
-    return {"ok": True}
+    path = arguments.get("path", "")
+
+    if name == "read_file" and path_starts_with(path, SENSITIVE_PATHS):
+        return deny("The agent may not read sensitive files.")
+
+    if name == "write_file" and path_starts_with(path, INTERNAL_PATHS):
+        return deny("The agent may not write internal loop state.")
+
+    if name == "write_file" and path_starts_with(path, SENSITIVE_PATHS):
+        return deny("The agent may not write secrets.")
+
+    if name == "write_file" and path_starts_with(path, SOURCE_PATHS):
+        return ask(
+            message=f"The agent wants to modify source code: {path}",
+            risk="changes code that may affect behavior",
+            rule_hint=f"write_file:{path}",
+        )
+
+    return allow()
+
+
+def prompt_for_approval(policy: dict) -> bool:
+    rule_hint = policy.get("rule_hint")
+    if rule_hint in session_approvals:
+        return True
+
+    print("\nApproval needed")
+    print(policy["message"])
+    print(f"Risk: {policy.get('risk', 'unknown')}")
+    print("\nAllow?")
+    print("  y  yes, once")
+    print("  s  yes, for this session")
+    print("  n  no")
+
+    choice = input("> ").strip().lower()
+    if choice == "s" and rule_hint:
+        session_approvals.add(rule_hint)
+        return True
+    return choice == "y"
+
+
+def policy_to_tool_result(name: str, policy: dict) -> dict:
+    return {
+        "ok": False,
+        "tool": name,
+        "error_type": "permission",
+        "message": policy["message"],
+        "retryable": policy.get("retryable", False),
+        "needs_approval": policy["decision"] == "ask",
+        "risk": policy.get("risk"),
+        "rule_hint": policy.get("rule_hint"),
+        "approval_scopes": policy.get("approval_scopes", []),
+    }
 
 
 def normalize_result(name: str, result) -> dict:
@@ -211,8 +290,13 @@ def handle_tool_call(tool_call) -> dict:
         arguments = parse_arguments(tool_call.function.arguments)
         validate_tool_call(name, arguments)
         policy = check_policy(name, arguments)
-        if not policy["ok"]:
-            return policy
+
+        if policy["decision"] == "deny":
+            return policy_to_tool_result(name, policy)
+
+        if policy["decision"] == "ask" and not prompt_for_approval(policy):
+            return policy_to_tool_result(name, policy)
+
         result = execute_tool(name, arguments)
         return normalize_result(name, result)
     except ToolError as error:
@@ -233,7 +317,19 @@ def call_model(messages: list[dict]):
     return response.choices[0].message
 
 
-def run_agent(messages: list[dict]) -> dict:
+def run_agent(task: str) -> dict:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a tiny coding agent. Use tools when you need to inspect "
+                "or change the workspace. Paths must stay inside the workspace. "
+                "When you have enough information, answer clearly."
+            ),
+        },
+        {"role": "user", "content": task},
+    ]
+
     tool_call_count = 0
     stop_reason = "max_turns"
 
@@ -285,24 +381,36 @@ def run_agent(messages: list[dict]) -> dict:
     }
 
 
-messages = [
-    {
-        "role": "system",
-        "content": (
-            "You are a tiny coding agent. Use tools when you need to inspect "
-            "or change the workspace. Paths must stay inside the workspace. "
-            "When you have enough information, answer clearly."
-        ),
-    },
-    {
-        "role": "user",
-        "content": (
-            "Inspect notes.txt, then write a short summary to summary.txt. "
-            "After writing it, read summary.txt back to confirm what you wrote."
-        ),
-    },
-]
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the tiny coding agent loop.")
+    parser.add_argument("task", help="The task for the agent to perform.")
+    parser.add_argument(
+        "--workspace",
+        default=".",
+        help="Workspace directory the agent can inspect and edit.",
+    )
+    return parser.parse_args()
 
 
-result = run_agent(messages)
-print(f"Stopped because: {result['stop_reason']}")
+def main() -> int:
+    global WORKSPACE
+
+    args = parse_args()
+    WORKSPACE = Path(args.workspace).expanduser().resolve()
+    if not WORKSPACE.exists() or not WORKSPACE.is_dir():
+        print(f"Workspace does not exist: {WORKSPACE}", file=sys.stderr)
+        return 3
+
+    print(f"Workspace: {WORKSPACE}")
+    result = run_agent(args.task)
+    print(f"\nStopped because: {result['stop_reason']}")
+
+    if result["stop_reason"] == "final_answer":
+        return 0
+    if result["stop_reason"] in {"max_turns", "tool_budget_exceeded"}:
+        return 2
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

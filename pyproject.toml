@@ -20,6 +20,9 @@ dev = [
 [tool.setuptools]
 py-modules = ["loop"]
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = [".", "src"]
 testpaths = ["tests"]

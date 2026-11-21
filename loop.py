@@ -1,3 +1,10 @@
+"""Tiny policy-guarded coding agent.
+
+This module is the CLI entrypoint and stays importable for backwards
+compatibility: the policy engine and filesystem tools live in
+``src/the_loop/`` and the symbols below are re-exported from there.
+"""
+
 import argparse
 import json
 import os
@@ -5,6 +12,50 @@ import sys
 from pathlib import Path
 
 from openai import OpenAI
+
+from the_loop.errors import ToolError
+from the_loop.policy import approvals, paths
+from the_loop.policy.approvals import session_approvals
+from the_loop.policy.paths import path_starts_with
+from the_loop.policy.paths import safe_path as _safe_path
+from the_loop.policy.rules import (
+    INTERNAL_PATHS,
+    SENSITIVE_PATHS,
+    SOURCE_PATHS,
+    allow,
+    ask,
+    check_policy,
+    deny,
+)
+from the_loop.tools.base import ToolResult
+from the_loop.tools.fs import (
+    IGNORED_NAMES,
+    edit_file,
+    list_dir,
+    read_file,
+    write_file,
+)
+
+__all__ = [
+    "IGNORED_NAMES",
+    "INTERNAL_PATHS",
+    "SENSITIVE_PATHS",
+    "SOURCE_PATHS",
+    "ToolError",
+    "ToolResult",
+    "allow",
+    "ask",
+    "check_policy",
+    "deny",
+    "edit_file",
+    "list_dir",
+    "path_starts_with",
+    "prompt_for_approval",
+    "read_file",
+    "safe_path",
+    "session_approvals",
+    "write_file",
+]
 
 
 BASE_URL = os.getenv("LOOP_BASE_URL", "http://localhost:1234/v1")
@@ -14,102 +65,31 @@ MAX_TURNS = 8
 MAX_TOOL_CALLS = 12
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
-session_approvals: set[str] = set()
 WORKSPACE = Path.cwd().resolve()
-
-IGNORED_NAMES = {
-    ".git",
-    ".venv",
-    "__pycache__",
-    "node_modules",
-    "dist",
-    "build",
-}
-
-SENSITIVE_PATHS = (".env", "secrets/")
-INTERNAL_PATHS = (".loop/",)
-SOURCE_PATHS = ("src/", "tests/")
-
-
-class ToolError(Exception):
-    def __init__(self, error_type: str, message: str, retryable: bool):
-        self.error_type = error_type
-        self.message = message
-        self.retryable = retryable
+paths.set_workspace(WORKSPACE)
 
 
 def safe_path(path: str) -> Path:
-    resolved = (WORKSPACE / path).resolve()
-    if not resolved.is_relative_to(WORKSPACE):
-        raise ToolError(
-            "permission",
-            "Path escapes the workspace.",
-            retryable=False,
-        )
-    return resolved
+    """Compatibility wrapper: sandbox against this module's WORKSPACE."""
+    return _safe_path(path, workspace=WORKSPACE)
 
 
-def path_starts_with(path: str, prefixes: tuple[str, ...]) -> bool:
-    return any(
-        path == prefix.rstrip("/") or path.startswith(prefix)
-        for prefix in prefixes
-    )
-
-
-def allow() -> dict:
-    return {"decision": "allow"}
-
-
-def deny(message: str) -> dict:
-    return {
-        "decision": "deny",
-        "message": message,
-        "retryable": False,
-    }
-
-
-def ask(message: str, risk: str, rule_hint: str) -> dict:
-    return {
-        "decision": "ask",
-        "message": message,
-        "risk": risk,
-        "rule_hint": rule_hint,
-        "approval_scopes": ["once", "session"],
-        "retryable": False,
-    }
-
-
-def list_dir(path: str) -> list[str]:
-    target = safe_path(path)
-    return sorted(
-        p.name
-        for p in target.iterdir()
-        if p.name not in IGNORED_NAMES
-    )
-
-
-def read_file(path: str) -> str:
-    target = safe_path(path)
-    return target.read_text(encoding="utf-8")
-
-
-def write_file(path: str, content: str) -> str:
-    target = safe_path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    return f"Wrote {path}"
+def prompt_for_approval(policy: dict) -> bool:
+    return approvals.request_approval(policy)
 
 
 TOOL_FUNCTIONS = {
     "list_dir": list_dir,
     "read_file": read_file,
     "write_file": write_file,
+    "edit_file": edit_file,
 }
 
 REQUIRED_ARGUMENTS = {
     "list_dir": ["path"],
     "read_file": ["path"],
     "write_file": ["path", "content"],
+    "edit_file": ["path", "old_text", "new_text"],
 }
 
 tools = [
@@ -180,6 +160,37 @@ tools = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Replace exactly one occurrence of old_text with new_text in an "
+                "existing UTF-8 text file. old_text must match the file exactly, "
+                "including whitespace, and must be unique; include surrounding "
+                "lines when needed. Use write_file to create a new file. "
+                "Path must be relative to the workspace."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to the workspace.",
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Exact text to replace; must match once.",
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text.",
+                    },
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
 ]
 
 
@@ -210,48 +221,6 @@ def validate_tool_call(name: str, arguments: dict) -> None:
     require(arguments, *REQUIRED_ARGUMENTS[name])
 
 
-def check_policy(name: str, arguments: dict) -> dict:
-    path = arguments.get("path", "")
-
-    if name == "read_file" and path_starts_with(path, SENSITIVE_PATHS):
-        return deny("The agent may not read sensitive files.")
-
-    if name == "write_file" and path_starts_with(path, INTERNAL_PATHS):
-        return deny("The agent may not write internal loop state.")
-
-    if name == "write_file" and path_starts_with(path, SENSITIVE_PATHS):
-        return deny("The agent may not write secrets.")
-
-    if name == "write_file" and path_starts_with(path, SOURCE_PATHS):
-        return ask(
-            message=f"The agent wants to modify source code: {path}",
-            risk="changes code that may affect behavior",
-            rule_hint=f"write_file:{path}",
-        )
-
-    return allow()
-
-
-def prompt_for_approval(policy: dict) -> bool:
-    rule_hint = policy.get("rule_hint")
-    if rule_hint in session_approvals:
-        return True
-
-    print("\nApproval needed")
-    print(policy["message"])
-    print(f"Risk: {policy.get('risk', 'unknown')}")
-    print("\nAllow?")
-    print("  y  yes, once")
-    print("  s  yes, for this session")
-    print("  n  no")
-
-    choice = input("> ").strip().lower()
-    if choice == "s" and rule_hint:
-        session_approvals.add(rule_hint)
-        return True
-    return choice == "y"
-
-
 def policy_to_tool_result(name: str, policy: dict) -> dict:
     return {
         "ok": False,
@@ -267,6 +236,22 @@ def policy_to_tool_result(name: str, policy: dict) -> dict:
 
 
 def normalize_result(name: str, result) -> dict:
+    if isinstance(result, ToolResult):
+        if not result.ok:
+            return {
+                "ok": False,
+                "tool": name,
+                "error_type": result.error_type,
+                "message": result.message,
+                "retryable": result.retryable,
+                "duration_ms": result.duration_ms,
+            }
+        return {
+            "ok": True,
+            "tool": name,
+            "result": result.data,
+            "duration_ms": result.duration_ms,
+        }
     return {"ok": True, "tool": name, "result": result}
 
 
@@ -289,6 +274,11 @@ def handle_tool_call(tool_call) -> dict:
     try:
         arguments = parse_arguments(tool_call.function.arguments)
         validate_tool_call(name, arguments)
+
+        # Keep the package sandbox in sync with this module's WORKSPACE so
+        # --workspace, and code that swaps WORKSPACE, applies to every tool.
+        paths.set_workspace(WORKSPACE)
+
         policy = check_policy(name, arguments)
 
         if policy["decision"] == "deny":
@@ -296,6 +286,13 @@ def handle_tool_call(tool_call) -> dict:
 
         if policy["decision"] == "ask" and not prompt_for_approval(policy):
             return policy_to_tool_result(name, policy)
+
+        if policy["decision"] != "allow":
+            # Fail closed if a future policy returns an unknown decision.
+            return policy_to_tool_result(
+                name,
+                deny(f"Unrecognized policy decision: {policy['decision']}"),
+            )
 
         result = execute_tool(name, arguments)
         return normalize_result(name, result)
@@ -401,6 +398,7 @@ def main() -> int:
         print(f"Workspace does not exist: {WORKSPACE}", file=sys.stderr)
         return 3
 
+    paths.set_workspace(WORKSPACE)
     print(f"Workspace: {WORKSPACE}")
     result = run_agent(args.task)
     print(f"\nStopped because: {result['stop_reason']}")

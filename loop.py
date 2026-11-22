@@ -35,6 +35,7 @@ from the_loop.tools.fs import (
     read_file,
     write_file,
 )
+from the_loop.tools.shell import run_shell, run_tests
 
 __all__ = [
     "IGNORED_NAMES",
@@ -52,6 +53,8 @@ __all__ = [
     "path_starts_with",
     "prompt_for_approval",
     "read_file",
+    "run_shell",
+    "run_tests",
     "safe_path",
     "session_approvals",
     "write_file",
@@ -83,6 +86,8 @@ TOOL_FUNCTIONS = {
     "read_file": read_file,
     "write_file": write_file,
     "edit_file": edit_file,
+    "run_shell": run_shell,
+    "run_tests": run_tests,
 }
 
 REQUIRED_ARGUMENTS = {
@@ -90,6 +95,17 @@ REQUIRED_ARGUMENTS = {
     "read_file": ["path"],
     "write_file": ["path", "content"],
     "edit_file": ["path", "old_text", "new_text"],
+    "run_shell": ["command"],
+    "run_tests": [],
+}
+
+TOOL_ARGUMENTS = {
+    "list_dir": {"path"},
+    "read_file": {"path"},
+    "write_file": {"path", "content"},
+    "edit_file": {"path", "old_text", "new_text"},
+    "run_shell": {"command", "timeout_s"},
+    "run_tests": {"args", "timeout_s"},
 }
 
 tools = [
@@ -191,6 +207,68 @@ tools = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "description": (
+                "Run a shell command inside an isolated Docker sandbox with no "
+                "network access, a read-only root filesystem, and the workspace "
+                "mounted at /workspace. Use this to inspect the environment or "
+                "run commands that are not covered by the other tools. The host "
+                "never executes the command directly. Requires human approval."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": (
+                            "Shell command to run inside the sandbox via sh -c."
+                        ),
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 300,
+                        "description": "Maximum runtime in seconds (default 30).",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_tests",
+            "description": (
+                "Run pytest inside the Docker sandbox with the workspace mounted "
+                "at /workspace. Arguments are passed directly to pytest as argv "
+                "(never through a shell). Use this to check whether changes pass "
+                "the test suite."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {
+                        "type": "string",
+                        "description": (
+                            "pytest arguments, for example '-q tests/' or "
+                            "'-q -k test_name' (default '-q')."
+                        ),
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 300,
+                        "description": "Maximum runtime in seconds (default 60).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -219,6 +297,13 @@ def validate_tool_call(name: str, arguments: dict) -> None:
     if name not in REQUIRED_ARGUMENTS:
         raise ToolError("unknown_tool", f"Unknown tool: {name}", False)
     require(arguments, *REQUIRED_ARGUMENTS[name])
+    unexpected = sorted(set(arguments) - TOOL_ARGUMENTS[name])
+    if unexpected:
+        raise ToolError(
+            "unknown_arguments",
+            f"Unknown arguments for {name}: {', '.join(unexpected)}",
+            retryable=True,
+        )
 
 
 def policy_to_tool_result(name: str, policy: dict) -> dict:
@@ -237,21 +322,26 @@ def policy_to_tool_result(name: str, policy: dict) -> dict:
 
 def normalize_result(name: str, result) -> dict:
     if isinstance(result, ToolResult):
-        if not result.ok:
-            return {
-                "ok": False,
-                "tool": name,
-                "error_type": result.error_type,
-                "message": result.message,
-                "retryable": result.retryable,
-                "duration_ms": result.duration_ms,
-            }
-        return {
-            "ok": True,
+        payload = {
+            "ok": result.ok,
             "tool": name,
-            "result": result.data,
-            "duration_ms": result.duration_ms,
         }
+        if result.ok:
+            payload["result"] = result.data
+        else:
+            payload.update(
+                {
+                    "error_type": result.error_type,
+                    "message": result.message,
+                    "retryable": result.retryable,
+                }
+            )
+            if result.data is not None:
+                payload["result"] = result.data
+        if result.exit_code is not None:
+            payload["exit_code"] = result.exit_code
+        payload["duration_ms"] = result.duration_ms
+        return payload
     return {"ok": True, "tool": name, "result": result}
 
 
@@ -287,14 +377,18 @@ def handle_tool_call(tool_call) -> dict:
         if policy["decision"] == "ask" and not prompt_for_approval(policy):
             return policy_to_tool_result(name, policy)
 
-        if policy["decision"] != "allow":
+        if policy["decision"] not in {"allow", "ask"}:
             # Fail closed if a future policy returns an unknown decision.
             return policy_to_tool_result(
                 name,
                 deny(f"Unrecognized policy decision: {policy['decision']}"),
             )
 
-        result = execute_tool(name, arguments)
+        # Sandbox tools re-check policy before invoking Docker. This context
+        # makes a one-shot interactive approval visible to that check without
+        # trusting a model-supplied argument.
+        with approvals.approve_current_call():
+            result = execute_tool(name, arguments)
         return normalize_result(name, result)
     except ToolError as error:
         return error_result(name, error)

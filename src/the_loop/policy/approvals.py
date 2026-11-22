@@ -1,4 +1,15 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 session_approvals: set[str] = set()
+
+# Approval granted by the interactive loop for the duration of a single tool
+# call. This keeps "yes, once" truly one-shot: the tool can re-check policy
+# without weakening the approval semantics or trusting model-supplied flags.
+_call_approved: ContextVar[bool] = ContextVar(
+    "the_loop_call_approved",
+    default=False,
+)
 
 
 def reset_session_approvals() -> None:
@@ -7,6 +18,21 @@ def reset_session_approvals() -> None:
 
 def is_approved(rule_hint: str | None) -> bool:
     return bool(rule_hint) and rule_hint in session_approvals
+
+
+def is_call_approved() -> bool:
+    """Return True while an approved tool call is executing."""
+    return _call_approved.get()
+
+
+@contextmanager
+def approve_current_call():
+    """Mark the current tool call as approved by the interactive loop."""
+    token = _call_approved.set(True)
+    try:
+        yield
+    finally:
+        _call_approved.reset(token)
 
 
 def request_approval(policy: dict, *, input_fn=input, output_fn=print) -> bool:

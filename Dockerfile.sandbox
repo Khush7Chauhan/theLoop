@@ -1,0 +1,22 @@
+# Minimal, unprivileged image for the-loop's Docker sandbox.
+#
+# The host never runs agent-chosen commands directly: `run_in_sandbox`
+# starts this image with a hardened `docker run` invocation and mounts the
+# workspace at /workspace.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/tmp
+
+RUN pip install --no-cache-dir pytest
+
+# Run as an unprivileged user. The sandbox has no network, no capabilities,
+# and a read-only root filesystem; only /workspace and /tmp are writable.
+RUN groupadd --gid 1000 sandbox \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash sandbox
+
+WORKDIR /workspace
+
+USER sandbox

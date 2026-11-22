@@ -1,8 +1,9 @@
 # the-loop
 
 A tiny coding-agent CLI. It sends a task to an OpenAI-compatible chat model and
-lets the model inspect and edit the workspace through four tools
-(`list_dir`, `read_file`, `write_file`, `edit_file`).
+lets the model inspect and edit the workspace through four filesystem tools
+(`list_dir`, `read_file`, `write_file`, `edit_file`) plus two sandbox-only tools
+(`run_shell`, `run_tests`).
 
 Every tool call goes through a policy engine before it runs:
 
@@ -12,6 +13,8 @@ Every tool call goes through a policy engine before it runs:
 | Write or edit `.env` or `secrets/` | denied |
 | Write or edit `.loop/` | denied |
 | Write or edit `src/` or `tests/` | asks for approval (once or for the session) |
+| `run_shell` | asks for approval (once or for the session) |
+| `run_tests` | allowed; pytest runs in the sandbox |
 | Unrecognized actions or paths | denied |
 | Everything else | allowed |
 
@@ -24,8 +27,32 @@ the text is missing or appears more than once it returns a retryable error
 (`not_found` / `not_unique`) and leaves the file untouched, so the model has to
 supply more context instead of guessing.
 
-The policy engine and filesystem tools live in `src/the_loop/`; `loop.py` is
-the CLI entrypoint and re-exports the old symbols for compatibility.
+The policy engine, filesystem tools, shell tools, and Docker sandbox live in
+`src/the_loop/`; `loop.py` is the CLI entrypoint and re-exports the old symbols
+for compatibility.
+
+## Docker sandbox
+
+`run_shell` and `run_tests` never execute agent-chosen commands on the host.
+They call `run_in_sandbox` in `src/the_loop/sandbox/docker.py`, which is the
+only place that invokes the Docker CLI. Each call starts a fresh container with:
+
+- no network (`--network=none`)
+- one CPU, 512 MB of memory, and a 64-process limit
+- all capabilities dropped and `no-new-privileges`
+- a read-only root filesystem, with `/workspace` bind-mounted and `/tmp` as a
+  writable tmpfs
+- a non-root user (`sandbox`, UID 1000)
+
+`run_shell` runs `sh -c <command>` inside that container. `run_tests` runs
+pytest strictly via argv, never through a shell. Timeouts forcibly remove the
+container, and stdout/stderr are bounded with a `[TRUNCATED]` marker.
+
+Build the image once:
+
+```bash
+docker build -f Dockerfile.sandbox -t the-loop-sandbox:latest .
+```
 
 `agent.py` lives on as `experiments/mcp_agent.py`, an unfinished MCP + Anthropic
 experiment. It is not part of the CLI and is not maintained.
@@ -72,8 +99,13 @@ budget is exhausted, and `3` when the workspace does not exist.
 ## Tests
 
 ```bash
-pytest
+pytest tests/unit          # fast; no Docker or model required
+pytest -m integration      # requires Docker and the sandbox image
+pytest                     # both suites; integration tests skip without Docker
 ```
 
-The tests cover `safe_path` (including symlink escapes), the policy rules,
-`edit_file`, and `ToolResult`; they do not call a model.
+The unit tests cover `safe_path` (including symlink escapes), the policy rules,
+`edit_file`, `ToolResult`, the Docker runner's hardening/error handling, and the
+shell tools. The integration tests verify the edit-then-pytest flow, no-network
+enforcement, timeout cleanup, the non-root user, and output truncation. They do
+not call a model.

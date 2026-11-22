@@ -26,3 +26,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = [".", "src"]
 testpaths = ["tests"]
+markers = [
+    "integration: requires a running Docker daemon and the the-loop-sandbox image",
+]

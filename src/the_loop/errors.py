@@ -4,3 +4,7 @@ class ToolError(Exception):
         self.error_type = error_type
         self.message = message
         self.retryable = retryable
+
+
+class ConfigError(Exception):
+    """Raised when CLI options, environment, or a policy file are invalid."""

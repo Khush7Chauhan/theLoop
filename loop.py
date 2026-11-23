@@ -8,11 +8,13 @@ compatibility: the policy engine and filesystem tools live in
 import argparse
 import json
 import os
-import sys
+import time
 from pathlib import Path
 
 from openai import OpenAI
 
+from the_loop.cli import build_parser
+from the_loop.cli import main as cli_main
 from the_loop.errors import ToolError
 from the_loop.policy import approvals, paths
 from the_loop.policy.approvals import session_approvals
@@ -46,13 +48,19 @@ __all__ = [
     "ToolResult",
     "allow",
     "ask",
+    "build_parser",
     "check_policy",
+    "configure",
     "deny",
     "edit_file",
+    "handle_tool_call",
     "list_dir",
+    "main",
+    "parse_args",
     "path_starts_with",
     "prompt_for_approval",
     "read_file",
+    "run_agent",
     "run_shell",
     "run_tests",
     "safe_path",
@@ -70,6 +78,31 @@ MAX_TOOL_CALLS = 12
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 WORKSPACE = Path.cwd().resolve()
 paths.set_workspace(WORKSPACE)
+
+_clients: dict[tuple[str, str], OpenAI] = {}
+
+
+def _client_for_config(config) -> OpenAI:
+    key = (config.base_url, config.api_key)
+    cached = _clients.get(key)
+    if cached is None:
+        cached = OpenAI(base_url=config.base_url, api_key=config.api_key)
+        _clients[key] = cached
+    return cached
+
+
+def configure(config) -> None:
+    """Apply a RunConfig to module-level compatibility settings."""
+    global WORKSPACE, MAX_TURNS, MAX_TOOL_CALLS, MODEL, BASE_URL, API_KEY, client
+
+    WORKSPACE = config.workspace
+    MAX_TURNS = config.max_turns
+    MAX_TOOL_CALLS = config.max_tool_calls
+    MODEL = config.model
+    BASE_URL = config.base_url
+    API_KEY = config.api_key
+    client = _client_for_config(config)
+    paths.set_workspace(WORKSPACE)
 
 
 def safe_path(path: str) -> Path:
@@ -306,8 +339,8 @@ def validate_tool_call(name: str, arguments: dict) -> None:
         )
 
 
-def policy_to_tool_result(name: str, policy: dict) -> dict:
-    return {
+def policy_to_tool_result(name: str, policy: dict, *, reason: str | None = None) -> dict:
+    result = {
         "ok": False,
         "tool": name,
         "error_type": "permission",
@@ -318,6 +351,9 @@ def policy_to_tool_result(name: str, policy: dict) -> dict:
         "rule_hint": policy.get("rule_hint"),
         "approval_scopes": policy.get("approval_scopes", []),
     }
+    if reason is not None:
+        result["reason"] = reason
+    return result
 
 
 def normalize_result(name: str, result) -> dict:
@@ -359,23 +395,36 @@ def execute_tool(name: str, arguments: dict):
     return TOOL_FUNCTIONS[name](**arguments)
 
 
-def handle_tool_call(tool_call) -> dict:
+def handle_tool_call(tool_call, *, config=None, approver=None, workspace=None) -> dict:
     name = tool_call.function.name
     try:
         arguments = parse_arguments(tool_call.function.arguments)
         validate_tool_call(name, arguments)
 
-        # Keep the package sandbox in sync with this module's WORKSPACE so
+        # Keep the package sandbox in sync with the active workspace so
         # --workspace, and code that swaps WORKSPACE, applies to every tool.
-        paths.set_workspace(WORKSPACE)
+        root = workspace or (config.workspace if config is not None else WORKSPACE)
+        paths.set_workspace(root)
 
         policy = check_policy(name, arguments)
 
         if policy["decision"] == "deny":
             return policy_to_tool_result(name, policy)
 
-        if policy["decision"] == "ask" and not prompt_for_approval(policy):
-            return policy_to_tool_result(name, policy)
+        if policy["decision"] == "ask":
+            if approver is None:
+                approved = prompt_for_approval(policy)
+                reason = None if approved else "interactive_declined"
+            else:
+                decision = approver.approve(
+                    policy,
+                    tool=name,
+                    arguments=arguments,
+                )
+                approved = decision.approved
+                reason = decision.reason
+            if not approved:
+                return policy_to_tool_result(name, policy, reason=reason)
 
         if policy["decision"] not in {"allow", "ask"}:
             # Fail closed if a future policy returns an unknown decision.
@@ -398,17 +447,35 @@ def log_event(event: dict) -> None:
     print(json.dumps(event))
 
 
-def call_model(messages: list[dict]):
-    response = client.chat.completions.create(
-        model=MODEL,
+def _call_model_with_usage(messages: list[dict], *, config=None):
+    api_client = _client_for_config(config) if config is not None else client
+    model = config.model if config is not None else MODEL
+    response = api_client.chat.completions.create(
+        model=model,
         messages=messages,
         tools=tools,
         tool_choice="auto",
     )
-    return response.choices[0].message
+    usage = getattr(response, "usage", None)
+    total_tokens = getattr(usage, "total_tokens", None)
+    return response.choices[0].message, total_tokens or 0
 
 
-def run_agent(task: str) -> dict:
+def call_model(messages: list[dict]):
+    message, _ = _call_model_with_usage(messages)
+    return message
+
+
+def run_agent(task: str, *, config=None, approver=None) -> dict:
+    workspace = config.workspace if config is not None else WORKSPACE
+    max_turns = config.max_turns if config is not None else MAX_TURNS
+    max_tool_calls = config.max_tool_calls if config is not None else MAX_TOOL_CALLS
+    max_tokens = config.max_tokens if config is not None else None
+    max_wall_clock_s = config.max_wall_clock_s if config is not None else None
+
+    started = time.monotonic()
+    token_count = 0
+
     messages = [
         {
             "role": "system",
@@ -424,26 +491,50 @@ def run_agent(task: str) -> dict:
     tool_call_count = 0
     stop_reason = "max_turns"
 
-    for turn in range(MAX_TURNS):
+    for turn in range(max_turns):
+        if (
+            max_wall_clock_s is not None
+            and time.monotonic() - started >= max_wall_clock_s
+        ):
+            stop_reason = "wall_clock_budget_exceeded"
+            break
+
         log_event({"type": "model_call", "turn": turn})
-        message = call_model(messages)
+        message, usage = _call_model_with_usage(messages, config=config)
+        token_count += usage
         messages.append(message.model_dump(exclude_none=True))
 
         if message.content:
             print("\nassistant:")
             print(message.content)
 
+        if max_tokens is not None and token_count >= max_tokens:
+            stop_reason = "token_budget_exceeded"
+            break
+
         if not message.tool_calls:
             stop_reason = "final_answer"
             break
 
         for tool_call in message.tool_calls:
+            if (
+                max_wall_clock_s is not None
+                and time.monotonic() - started >= max_wall_clock_s
+            ):
+                stop_reason = "wall_clock_budget_exceeded"
+                break
+
             tool_call_count += 1
-            if tool_call_count > MAX_TOOL_CALLS:
+            if tool_call_count > max_tool_calls:
                 stop_reason = "tool_budget_exceeded"
                 break
 
-            result = handle_tool_call(tool_call)
+            result = handle_tool_call(
+                tool_call,
+                config=config,
+                approver=approver,
+                workspace=workspace,
+            )
             log_event(
                 {
                     "type": "tool_result",
@@ -473,35 +564,12 @@ def run_agent(task: str) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the tiny coding agent loop.")
-    parser.add_argument("task", help="The task for the agent to perform.")
-    parser.add_argument(
-        "--workspace",
-        default=".",
-        help="Workspace directory the agent can inspect and edit.",
-    )
-    return parser.parse_args()
+    return build_parser().parse_args()
 
 
-def main() -> int:
-    global WORKSPACE
-
-    args = parse_args()
-    WORKSPACE = Path(args.workspace).expanduser().resolve()
-    if not WORKSPACE.exists() or not WORKSPACE.is_dir():
-        print(f"Workspace does not exist: {WORKSPACE}", file=sys.stderr)
-        return 3
-
-    paths.set_workspace(WORKSPACE)
-    print(f"Workspace: {WORKSPACE}")
-    result = run_agent(args.task)
-    print(f"\nStopped because: {result['stop_reason']}")
-
-    if result["stop_reason"] == "final_answer":
-        return 0
-    if result["stop_reason"] in {"max_turns", "tool_budget_exceeded"}:
-        return 2
-    return 1
+def main(argv: list[str] | None = None) -> int:
+    """Delegate to the CLI module while keeping ``loop.main`` importable."""
+    return cli_main(argv)
 
 
 if __name__ == "__main__":

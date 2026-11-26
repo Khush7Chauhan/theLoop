@@ -109,6 +109,7 @@ token, or wall-clock budget is exhausted, and `3` for configuration errors
 | `--max-tokens N` | unbounded | Optional total token budget |
 | `--max-wall-clock-s N` | unbounded | Optional wall-clock budget in seconds |
 | `--features a,b` | empty | Comma-separated feature flags (normalized to a sorted set) |
+| `--output-dir PATH` | `<workspace>/.loop/runs/<run_id>` | Directory for `trace.jsonl` and `summary.json` |
 
 CLI flags take precedence over environment variables, which take precedence
 over the defaults above.
@@ -135,6 +136,15 @@ with reason `headless_unresolved_ask`.
 Deny entries win over allow entries. Secrets (`.env`, `secrets/`), internal
 state (`.loop/`), and paths that escape the workspace are always denied and
 cannot be overridden.
+
+### Traces and summaries
+
+Every run writes an append-only JSONL trace (`trace.jsonl`) and a formatted
+`summary.json` in the run directory. The trace contains `run_start`,
+`llm_turn`, `policy_decision`, `tool_result`, and `run_end` events with UTC
+timestamps, token usage, latency, and cost. The summary is written in a
+`finally` block, so budget-exceeded and failed runs still produce valid output.
+Headless mode prints the summary path.
 
 ## Tests
 

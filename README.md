@@ -93,8 +93,48 @@ python loop.py --workspace ../some-project "summarize this repo"
 ```
 
 The workspace defaults to the current directory. Agent events are printed as
-JSON lines; the run exits `0` on a final answer, `2` when a turn or tool-call
-budget is exhausted, and `3` when the workspace does not exist.
+JSON lines; the run exits `0` on a final answer, `2` when a turn, tool-call,
+token, or wall-clock budget is exhausted, and `3` for configuration errors
+(including a missing or malformed policy file).
+
+### CLI options
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--workspace PATH` | current directory | Directory the agent may inspect and edit |
+| `--headless` | off | Never prompt; resolve approvals from `--policy-file` |
+| `--policy-file PATH` | none | JSON allow/deny overrides for headless mode |
+| `--max-turns N` | `8` | Maximum model turns |
+| `--max-tool-calls N` | `12` | Maximum tool calls across the run |
+| `--max-tokens N` | unbounded | Optional total token budget |
+| `--max-wall-clock-s N` | unbounded | Optional wall-clock budget in seconds |
+| `--features a,b` | empty | Comma-separated feature flags (normalized to a sorted set) |
+
+CLI flags take precedence over environment variables, which take precedence
+over the defaults above.
+
+### Headless approvals
+
+Headless runs never read stdin. An `ask` decision is approved only when the
+policy file explicitly allows its tool or path; anything unresolved is denied
+with reason `headless_unresolved_ask`.
+
+```json
+{
+  "allow": {
+    "tools": ["run_shell"],
+    "paths": ["src/*", "tests/*"]
+  },
+  "deny": {
+    "tools": ["run_tests"],
+    "paths": ["docs/*"]
+  }
+}
+```
+
+Deny entries win over allow entries. Secrets (`.env`, `secrets/`), internal
+state (`.loop/`), and paths that escape the workspace are always denied and
+cannot be overridden.
 
 ## Tests
 

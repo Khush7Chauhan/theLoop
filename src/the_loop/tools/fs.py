@@ -6,6 +6,7 @@ from the_loop.tools.base import ToolResult
 
 IGNORED_NAMES = {
     ".git",
+    ".loop",
     ".venv",
     "__pycache__",
     "node_modules",

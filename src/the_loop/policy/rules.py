@@ -85,11 +85,11 @@ def check_policy(name: str, arguments: dict) -> dict:
     except ToolError as error:
         return deny(error.message)
 
+    if path_starts_with(path, INTERNAL_PATHS):
+        return deny("The agent may not access internal loop state.")
+
     if name in READ_ACTIONS and path_starts_with(path, SENSITIVE_PATHS):
         return deny("The agent may not read sensitive files.")
-
-    if name in WRITE_ACTIONS and path_starts_with(path, INTERNAL_PATHS):
-        return deny("The agent may not write internal loop state.")
 
     if name in WRITE_ACTIONS and path_starts_with(path, SENSITIVE_PATHS):
         return deny("The agent may not write secrets.")
